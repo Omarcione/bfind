@@ -103,11 +103,35 @@ static time_t g_now;
  */
 static bool filter_matches(const filter_t *f, const char *path,
                            const struct stat *sb) {
-    (void)f;
-    (void)path;
-    (void)sb;
-    /* TODO: Your implementation here */
-    return false;
+    switch (f->kind)
+    {
+    case FILTER_NAME:
+        return fnmatch(f->filter.pattern, path, 0) == 0;
+    case FILTER_TYPE:;
+        mode_t m = sb->st_mode;
+
+        switch (f->filter.type_char)
+        {
+        case 'f': return S_ISREG(m);
+        case 'd': return S_ISDIR(m);
+        case 'l': return S_ISLNK(m);
+        }
+    case FILTER_MTIME:
+        return (difftime(g_now, sb->st_mtime) / 86400) <= f->filter.mtime_days; // modified in last N days
+    case FILTER_SIZE:;
+        off_t target = f->filter.size.size_bytes;
+        off_t file_size = sb->st_size;
+        
+        switch (f->filter.size.size_cmp)
+        {
+        case SIZE_CMP_EXACT: return file_size == target;
+        case SIZE_CMP_GREATER: return file_size > target;
+        case SIZE_CMP_LESS: return file_size < target;
+        }
+    case FILTER_PERM:;
+        mode_t perms = sb->st_mode & 07777;
+        return f->filter.perm_mode == perms;
+    }
 }
 
 /* Check if ALL filters match (AND semantics).
