@@ -87,7 +87,9 @@ static bool g_follow_links = false;
 static bool g_xdev = false;
 static dev_t g_start_dev = 0;
 static time_t g_now;
-
+static dev_ino_t *seen_inos = NULL; //init if -L set
+static int seen_inos_cnt = 0;
+static int seen_inos_cap = 8;
 /* ------------------------------------------------------------------ */
 /*  Filter matching                                                    */
 /* ------------------------------------------------------------------ */
@@ -105,9 +107,12 @@ static bool filter_matches(const filter_t *f, const char *path,
                            const struct stat *sb) {
     switch (f->kind)
     {
-    case FILTER_NAME:
-        return fnmatch(f->filter.pattern, path, 0) == 0;
-    case FILTER_TYPE:;
+    case FILTER_NAME: {
+        const char *filename = strrchr(path, '/'); // finds last '/'
+        filename = filename ? filename + 1 : path;  // skip the '/', or use path if no '/' found
+        return fnmatch(f->filter.pattern, filename, 0) == 0;
+    }
+    case FILTER_TYPE: {
         mode_t m = sb->st_mode;
 
         switch (f->filter.type_char)
@@ -116,9 +121,10 @@ static bool filter_matches(const filter_t *f, const char *path,
         case 'd': return S_ISDIR(m);
         case 'l': return S_ISLNK(m);
         }
+    }
     case FILTER_MTIME:
         return (difftime(g_now, sb->st_mtime) / 86400) <= f->filter.mtime_days; // modified in last N days
-    case FILTER_SIZE:;
+    case FILTER_SIZE: {
         off_t target = f->filter.size.size_bytes;
         off_t file_size = sb->st_size;
         
@@ -128,11 +134,13 @@ static bool filter_matches(const filter_t *f, const char *path,
         case SIZE_CMP_GREATER: return file_size > target;
         case SIZE_CMP_LESS: return file_size < target;
         }
-    case FILTER_PERM:;
+    }
+    case FILTER_PERM: {
         mode_t perms = sb->st_mode & 07777;
         return f->filter.perm_mode == perms;
     }
-}
+    }
+}  
 
 /* Check if ALL filters match (AND semantics).
  * Returns true if every filter matches, false otherwise. */
@@ -227,7 +235,7 @@ static char **parse_args(int argc, char *argv[], int *npaths) {
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
 
-            exit(EXIT_FAILURE);
+            exit(EXIT_SUCCESS);
         }
 
         // handle options before paths 
@@ -357,6 +365,33 @@ static char **parse_args(int argc, char *argv[], int *npaths) {
     return paths;
 }
 
+// Returns true if the current path is a starting path, used to decide if we need to free the duped path string
+bool is_start_path(char **start_paths, int npaths, char *cur_path) {
+    for (int i = 0; i < npaths; i++) {
+        if (strcmp(start_paths[i], cur_path) == 0)
+        return true;
+    }
+    return false;
+}
+
+void mark_seen(dev_t dev, ino_t ino) {
+    seen_inos_cnt++;
+    if (seen_inos_cnt == seen_inos_cap) {
+        seen_inos_cap*=2;
+        seen_inos = realloc(seen_inos, sizeof(dev_ino_t) * seen_inos_cap);
+    }
+    seen_inos[seen_inos_cnt].dev = dev;
+    seen_inos[seen_inos_cnt].ino = ino;
+}
+
+bool check_seen(dev_t dev, ino_t ino) {
+    for (int i = 0; i < seen_inos_cnt; i++) {
+        if (seen_inos[i].dev == dev && seen_inos[i].ino == ino)
+            return true;
+    }
+    return false;
+}
+
 /* ------------------------------------------------------------------ */
 /*  BFS traversal                                                      */
 /* ------------------------------------------------------------------ */
@@ -385,9 +420,81 @@ static char **parse_args(int argc, char *argv[], int *npaths) {
  * The provided queue library (queue.h) implements a generic FIFO queue.
  */
 static void bfs_traverse(char **start_paths, int npaths) {
-    (void)start_paths;
-    (void)npaths;
-    /* TODO: Your implementation here */
+    queue_t q;
+    queue_init(&q);
+
+    for (int i = 0; i < npaths; i++) {
+        queue_enqueue(&q, start_paths[i]);
+        if (g_xdev && !g_start_dev) {
+            //which std_dev do we check?
+            struct stat start_sb;
+            int stat_res = g_follow_links ? stat(start_paths[i], &start_sb) : lstat(start_paths[i], &start_sb);
+            if (stat_res < 0) {
+                fprintf(stderr, "Stat failed for path %s\n", start_paths[i]);
+                continue;
+            }    
+            g_start_dev = start_sb.st_dev;
+        }
+    }
+
+    if (g_xdev && !g_start_dev) {
+        fprintf(stderr, "cannot get starting path filesystem");
+        exit(1);
+    }
+
+    // allocate visted inodes arr
+    if(!(seen_inos = malloc(sizeof(dev_ino_t) * seen_inos_cap))) {
+        perror("malloc");
+        exit(1);
+    }
+    
+    while (!queue_is_empty(&q)) {
+        char *cur_path = queue_dequeue(&q);
+        struct stat sb;
+        int stat_res = g_follow_links ? stat(cur_path, &sb) : lstat(cur_path, &sb);
+        if (stat_res < 0) {
+            fprintf(stderr, "Stat failed for path %s\n", cur_path);
+            continue;
+        }
+        if (matches_all_filters(cur_path, &sb)) {
+            printf("%s\n", cur_path);
+        }
+
+        // mark seen, add to array
+        mark_seen(sb.st_dev, sb.st_ino);
+
+        mode_t m = sb.st_mode;
+
+        if (g_xdev && sb.st_dev != g_start_dev) //skip if different file system
+            continue;
+
+        if (S_ISDIR(m) || (g_follow_links && S_ISLNK(m))) {
+            DIR *dir = opendir(cur_path);
+            if (!dir) {
+                fprintf(stderr, "cannot open %s: %s\n", cur_path, strerror(errno));
+            }
+            struct dirent *entry;
+            while ((entry = readdir(dir))) {
+                if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) // skip . and .. 
+                continue;
+                char child_path[PATH_MAX];
+                snprintf(child_path, sizeof(child_path), "%s/%s", cur_path, entry->d_name);
+                struct stat child_sb;
+                if (g_follow_links && S_ISLNK(m)) { 
+                    int child_stat_res = g_follow_links ? stat(child_path, &child_sb) : lstat(child_path, &child_sb);
+                    if (check_seen(child_sb.st_dev, child_sb.st_ino)) {
+                        continue;
+                }
+                }
+                
+                queue_enqueue(&q, strdup(child_path)); // make a copy of str
+            }
+        }
+        if (!is_start_path(start_paths, npaths, cur_path))
+            free(cur_path);
+    }
+    free(seen_inos);
+
 }
 
 /* ------------------------------------------------------------------ */
