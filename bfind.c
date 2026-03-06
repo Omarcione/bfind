@@ -374,14 +374,15 @@ bool is_start_path(char **start_paths, int npaths, char *cur_path) {
     return false;
 }
 
+// marks an inode as seen, reallocates seen array to current cap*2 if needed
 void mark_seen(dev_t dev, ino_t ino) {
-    seen_inos_cnt++;
     if (seen_inos_cnt == seen_inos_cap) {
         seen_inos_cap*=2;
         seen_inos = realloc(seen_inos, sizeof(dev_ino_t) * seen_inos_cap);
     }
     seen_inos[seen_inos_cnt].dev = dev;
     seen_inos[seen_inos_cnt].ino = ino;
+    seen_inos_cnt++;
 }
 
 bool check_seen(dev_t dev, ino_t ino) {
@@ -424,7 +425,7 @@ static void bfs_traverse(char **start_paths, int npaths) {
     queue_init(&q);
 
     for (int i = 0; i < npaths; i++) {
-        queue_enqueue(&q, start_paths[i]);
+        queue_enqueue(&q, strdup(start_paths[i])); // dup so we can free path unconditionally
         if (g_xdev && !g_start_dev) {
             //which std_dev do we check?
             struct stat start_sb;
@@ -454,6 +455,7 @@ static void bfs_traverse(char **start_paths, int npaths) {
         int stat_res = g_follow_links ? stat(cur_path, &sb) : lstat(cur_path, &sb);
         if (stat_res < 0) {
             fprintf(stderr, "Stat failed for path %s\n", cur_path);
+            free(cur_path);
             continue;
         }
         if (matches_all_filters(cur_path, &sb)) {
@@ -461,7 +463,8 @@ static void bfs_traverse(char **start_paths, int npaths) {
         }
 
         // mark seen, add to array
-        mark_seen(sb.st_dev, sb.st_ino);
+        if (g_follow_links)
+            mark_seen(sb.st_dev, sb.st_ino);
 
         mode_t m = sb.st_mode;
 
@@ -472,26 +475,30 @@ static void bfs_traverse(char **start_paths, int npaths) {
             DIR *dir = opendir(cur_path);
             if (!dir) {
                 fprintf(stderr, "cannot open %s: %s\n", cur_path, strerror(errno));
+                free(cur_path);
+                continue;
             }
             struct dirent *entry;
             while ((entry = readdir(dir))) {
                 if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) // skip . and .. 
-                continue;
+                    continue;
                 char child_path[PATH_MAX];
                 snprintf(child_path, sizeof(child_path), "%s/%s", cur_path, entry->d_name);
                 struct stat child_sb;
-                if (g_follow_links && S_ISLNK(m)) { 
-                    int child_stat_res = g_follow_links ? stat(child_path, &child_sb) : lstat(child_path, &child_sb);
-                    if (check_seen(child_sb.st_dev, child_sb.st_ino)) {
-                        continue;
-                }
+                if (g_follow_links) { 
+                    int child_stat_res = stat(child_path, &child_sb);
+                    if (S_ISLNK(child_sb.st_mode)) { 
+                        if (check_seen(child_sb.st_dev, child_sb.st_ino)) {
+                            continue;
+                        }
+                    }
                 }
                 
                 queue_enqueue(&q, strdup(child_path)); // make a copy of str
             }
+            closedir(dir);
         }
-        if (!is_start_path(start_paths, npaths, cur_path))
-            free(cur_path);
+        free(cur_path);
     }
     free(seen_inos);
 
