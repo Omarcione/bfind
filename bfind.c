@@ -198,7 +198,7 @@ static off_t parse_size(const char *arg) {
     char *endptr;
 
     long value = strtol(arg, &endptr, 10);
-    if (value == 0){
+    if (endptr == arg || value < 0) {
         fprintf(stderr, "Size not valid: %s\n", arg);
         exit(EXIT_FAILURE);
     }
@@ -239,91 +239,92 @@ static char **parse_args(int argc, char *argv[], int *npaths) {
         }
 
         // handle options before paths 
-        else if (!parsing_filters && argv[i][0] == '-') {
+        else if (argv[i][0] == '-') {
             if (strcmp(argv[i], "-L") == 0) {
                 g_follow_links = true;
             } 
             else if (strcmp(argv[i], "-xdev") == 0) {
                 g_xdev = true;
             } 
+        
+            // handle filters
+            else if (strcmp(argv[i], "-name") == 0) {
+                parsing_filters = true;
+                if (i + 1 >= argc) { 
+                    fprintf(stderr, "-name requires an argument\n"); 
+                    exit(EXIT_FAILURE); 
+                }
+                g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
+                g_filters[g_nfilters].kind = FILTER_NAME;
+                g_filters[g_nfilters].filter.pattern = strdup(argv[++i]);
+                g_nfilters++;
+            }
+            else if (strcmp(argv[i], "-type") == 0) {
+                parsing_filters = true;
+                if (i + 1 >= argc) { 
+                    fprintf(stderr, "-type requires an argument\n"); 
+                    exit(EXIT_FAILURE); 
+                }
+                i++;
+                if (argv[i][0] != 'f' && argv[i][0] != 'd' && argv[i][0] != 'l') {
+                    fprintf(stderr, "-type must be f, d, or l\n"); 
+                    exit(EXIT_FAILURE);
+                }
+                g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
+                g_filters[g_nfilters].kind = FILTER_TYPE;
+                g_filters[g_nfilters].filter.type_char = argv[i][0];
+                g_nfilters++;
+            }
+            else if (strcmp(argv[i], "-mtime") == 0) {
+                parsing_filters = true;
+                if (i + 1 >= argc) { 
+                    fprintf(stderr, "-mtime requires an argument\n"); 
+                    exit(EXIT_FAILURE); 
+                }
+                g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
+                g_filters[g_nfilters].kind = FILTER_MTIME;
+                g_filters[g_nfilters].filter.mtime_days = atoi(argv[++i]);
+                g_nfilters++;
+            }
+            else if (strcmp(argv[i], "-size") == 0) {
+                parsing_filters = true;
+                if (i + 1 >= argc) { 
+                    fprintf(stderr, "-size requires an argument\n"); 
+                    exit(EXIT_FAILURE); 
+                }
+                i++;
+                const char *specifier = argv[i];
+                size_cmp_t cmp = SIZE_CMP_EXACT;
+                if (specifier[0] == '+') { 
+                    cmp = SIZE_CMP_GREATER; 
+                    specifier++; 
+                }
+                else if (specifier[0] == '-') { 
+                    cmp = SIZE_CMP_LESS;    
+                    specifier++; 
+                }
+                g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
+                g_filters[g_nfilters].kind = FILTER_SIZE;
+                g_filters[g_nfilters].filter.size.size_bytes = parse_size(specifier);
+                g_filters[g_nfilters].filter.size.size_cmp = cmp;
+                g_nfilters++;
+            }
+            else if (strcmp(argv[i], "-perm") == 0) {
+                parsing_filters = true;
+                if (i + 1 >= argc) { 
+                    fprintf(stderr, "-perm requires an argument\n"); 
+                    exit(EXIT_FAILURE); 
+                }
+                g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
+                g_filters[g_nfilters].kind = FILTER_PERM;
+                g_filters[g_nfilters].filter.perm_mode = (mode_t)strtol(argv[++i], NULL, 8); // octal base
+                g_nfilters++;
+            }
+
             else {
                 fprintf(stderr, "Unknown option: %s\n", argv[i]);
                 exit(EXIT_FAILURE);
             }
-        }
-        
-        // handle filters
-        else if (strcmp(argv[i], "-name") == 0) {
-            parsing_filters = true;
-            if (i + 1 >= argc) { 
-                fprintf(stderr, "-name requires an argument\n"); 
-                exit(EXIT_FAILURE); 
-            }
-            g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
-            g_filters[g_nfilters].kind = FILTER_NAME;
-            g_filters[g_nfilters].filter.pattern = strdup(argv[++i]);
-            g_nfilters++;
-        }
-        else if (strcmp(argv[i], "-type") == 0) {
-            parsing_filters = true;
-            if (i + 1 >= argc) { 
-                fprintf(stderr, "-type requires an argument\n"); 
-                exit(EXIT_FAILURE); 
-            }
-            i++;
-            if (argv[i][0] != 'f' && argv[i][0] != 'd' && argv[i][0] != 'l') {
-                fprintf(stderr, "-type must be f, d, or l\n"); 
-                exit(EXIT_FAILURE);
-            }
-            g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
-            g_filters[g_nfilters].kind = FILTER_TYPE;
-            g_filters[g_nfilters].filter.type_char = argv[i][0];
-            g_nfilters++;
-        }
-        else if (strcmp(argv[i], "-mtime") == 0) {
-            parsing_filters = true;
-            if (i + 1 >= argc) { 
-                fprintf(stderr, "-mtime requires an argument\n"); 
-                exit(EXIT_FAILURE); 
-            }
-            g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
-            g_filters[g_nfilters].kind = FILTER_MTIME;
-            g_filters[g_nfilters].filter.mtime_days = atoi(argv[++i]);
-            g_nfilters++;
-        }
-        else if (strcmp(argv[i], "-size") == 0) {
-            parsing_filters = true;
-            if (i + 1 >= argc) { 
-                fprintf(stderr, "-size requires an argument\n"); 
-                exit(EXIT_FAILURE); 
-            }
-            i++;
-            const char *specifier = argv[i];
-            size_cmp_t cmp = SIZE_CMP_EXACT;
-            if (specifier[0] == '+') { 
-                cmp = SIZE_CMP_GREATER; 
-                specifier++; 
-            }
-            else if (specifier[0] == '-') { 
-                cmp = SIZE_CMP_LESS;    
-                specifier++; 
-            }
-            g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
-            g_filters[g_nfilters].kind = FILTER_SIZE;
-            g_filters[g_nfilters].filter.size.size_bytes = parse_size(specifier);
-            g_filters[g_nfilters].filter.size.size_cmp = cmp;
-            g_nfilters++;
-        }
-        else if (strcmp(argv[i], "-perm") == 0) {
-            parsing_filters = true;
-            if (i + 1 >= argc) { 
-                fprintf(stderr, "-perm requires an argument\n"); 
-                exit(EXIT_FAILURE); 
-            }
-            g_filters = realloc(g_filters, sizeof(filter_t) * (g_nfilters + 1));
-            g_filters[g_nfilters].kind = FILTER_PERM;
-            g_filters[g_nfilters].filter.perm_mode = (mode_t)strtol(argv[++i], NULL, 8); // octal base
-            g_nfilters++;
         }
 
         // handle path args (anything that doesn't start with '-')
@@ -501,7 +502,6 @@ static void bfs_traverse(char **start_paths, int npaths) {
         free(cur_path);
     }
     free(seen_inos);
-
 }
 
 /* ------------------------------------------------------------------ */
@@ -513,7 +513,7 @@ int main(int argc, char *argv[]) {
 
     int npaths = 0;
     char **paths = parse_args(argc, argv, &npaths);
-
+    
     bfs_traverse(paths, npaths);
 
     free(paths);
