@@ -30,6 +30,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include "queue.h"
 
@@ -78,6 +79,15 @@ typedef struct {
 } dev_ino_t;
 
 /* ------------------------------------------------------------------ */
+/*  Queue entry (path + its root filesystem device)                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char *path;
+    dev_t start_dev;
+} queue_entry_t;
+
+/* ------------------------------------------------------------------ */
 /*  Global configuration                                               */
 /* ------------------------------------------------------------------ */
 
@@ -85,7 +95,6 @@ static filter_t *g_filters = NULL;
 static int g_nfilters = 0;
 static bool g_follow_links = false;
 static bool g_xdev = false;
-static dev_t g_start_dev = 0;
 static time_t g_now;
 static dev_ino_t *seen_inos = NULL; //init if -L set
 static int seen_inos_cnt = 0;
@@ -425,37 +434,41 @@ static void bfs_traverse(char **start_paths, int npaths) {
     queue_t q;
     queue_init(&q);
 
+    if (g_follow_links) {
+        seen_inos = malloc(sizeof(dev_ino_t) * seen_inos_cap);
+        if (!seen_inos) { perror("malloc"); exit(1); }
+    }
+
+    // Enqueue each start path with its own device
     for (int i = 0; i < npaths; i++) {
-        queue_enqueue(&q, strdup(start_paths[i])); // dup so we can free path unconditionally
-        if (g_xdev && !g_start_dev) {
-            //which std_dev do we check?
-            struct stat start_sb;
-            int stat_res = g_follow_links ? stat(start_paths[i], &start_sb) : lstat(start_paths[i], &start_sb);
-            if (stat_res < 0) {
-                fprintf(stderr, "Stat failed for path %s\n", start_paths[i]);
-                continue;
-            }    
-            g_start_dev = start_sb.st_dev;
+        struct stat start_sb;
+        int stat_res = g_follow_links ? stat(start_paths[i], &start_sb) : lstat(start_paths[i], &start_sb);
+        if (stat_res < 0) {
+            fprintf(stderr, "stat failed for %s: %s\n", start_paths[i], strerror(errno));
+            continue;
         }
-    }
-
-    if (g_xdev && !g_start_dev) {
-        fprintf(stderr, "cannot get starting path filesystem");
-        exit(1);
-    }
-
-    // allocate visted inodes arr
-    if(!(seen_inos = malloc(sizeof(dev_ino_t) * seen_inos_cap))) {
-        perror("malloc");
-        exit(1);
+        queue_entry_t *e = malloc(sizeof(queue_entry_t));
+        e->path      = strdup(start_paths[i]);
+        e->start_dev = start_sb.st_dev;  // each root remembers its own device
+        queue_enqueue(&q, e);
     }
     
     while (!queue_is_empty(&q)) {
-        char *cur_path = queue_dequeue(&q);
+        queue_entry_t *e = queue_dequeue(&q);
+        char *cur_path  = e->path;
+        dev_t start_dev = e->start_dev;  // the device this subtree is rooted on
+        free(e);
+
         struct stat sb;
         int stat_res = g_follow_links ? stat(cur_path, &sb) : lstat(cur_path, &sb);
         if (stat_res < 0) {
-            fprintf(stderr, "Stat failed for path %s\n", cur_path);
+            fprintf(stderr, "stat failed for %s: %s\n", cur_path, strerror(errno));
+            free(cur_path);
+            continue;
+        }
+
+        // -xdev: skip if we've crossed into a different filesystem
+        if (g_xdev && (sb.st_dev != start_dev)) {
             free(cur_path);
             continue;
         }
@@ -467,12 +480,7 @@ static void bfs_traverse(char **start_paths, int npaths) {
         if (g_follow_links)
             mark_seen(sb.st_dev, sb.st_ino);
 
-        mode_t m = sb.st_mode;
-
-        if (g_xdev && sb.st_dev != g_start_dev) //skip if different file system
-            continue;
-
-        if (S_ISDIR(m) || (g_follow_links && S_ISLNK(m))) {
+        if (S_ISDIR(sb.st_mode) || (g_follow_links && S_ISLNK(sb.st_mode))) {
             DIR *dir = opendir(cur_path);
             if (!dir) {
                 fprintf(stderr, "cannot open %s: %s\n", cur_path, strerror(errno));
@@ -485,17 +493,19 @@ static void bfs_traverse(char **start_paths, int npaths) {
                     continue;
                 char child_path[PATH_MAX];
                 snprintf(child_path, sizeof(child_path), "%s/%s", cur_path, entry->d_name);
-                struct stat child_sb;
-                if (g_follow_links) { 
-                    int child_stat_res = stat(child_path, &child_sb);
-                    if (S_ISLNK(child_sb.st_mode)) { 
-                        if (check_seen(child_sb.st_dev, child_sb.st_ino)) {
-                            continue;
-                        }
-                    }
+
+                if (g_follow_links) {
+                    struct stat child_sb;
+                    if (stat(child_path, &child_sb) == 0 &&
+                        S_ISDIR(child_sb.st_mode) &&
+                        check_seen(child_sb.st_dev, child_sb.st_ino))
+                        continue;  // cycle detected
                 }
-                
-                queue_enqueue(&q, strdup(child_path)); // make a copy of str
+
+                queue_entry_t *child = malloc(sizeof(queue_entry_t));
+                child->path      = strdup(child_path);
+                child->start_dev = start_dev;  // propagate parent's root device
+                queue_enqueue(&q, child);
             }
             closedir(dir);
         }
