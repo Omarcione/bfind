@@ -148,6 +148,8 @@ static bool filter_matches(const filter_t *f, const char *path,
         mode_t perms = sb->st_mode & 07777;
         return f->filter.perm_mode == perms;
     }
+    default:
+        return false; // should never happen
     }
 }  
 
